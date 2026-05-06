@@ -1,0 +1,228 @@
+name: EKS Staging Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      FILE_PATH:
+        description: "service values file path"
+        required: true
+        type: string
+      SERVICE_NAME:
+        description: "Service-name"
+        required: true
+        type: string
+      SECRET_FILE_PATH:
+        description: "A path to file to hold the content defined in 'SECRET_FILE_CONTENT' secret"
+        required: false
+        type: string
+      SECRET_CONTENT_IS_BASE64:
+        description: "Base64 decode the value from 'SECRET_FILE_CONTENT' before writing the file"
+        required: false
+        type: string
+      BUILD_COMMAND:
+        description: "build command"
+        required: false
+        type: string
+      CUSTOM_DOCKER_PATH:
+        description: "Custom docker build command to override the default"
+        required: false
+        type: string
+      IMAGE_TAG:
+        description: "Optional custom image tag. If provided, used as the primary image tag instead of the auto-generated DATE-BUILD_NUMBER tag."
+        required: false
+        type: string
+
+    secrets:
+      PAT_TOKEN:
+        description: "PAT TOKEN"
+        required: false
+      SECRET_FILE_CONTENT:
+        description: "Content of this secret will be written to file path identified by 'SECRET_FILE_PATH'"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.build-image.outputs.image-tag }}
+      build-number-tag: ${{ steps.build-image.outputs.build-number-tag }}
+
+    steps:
+      - name: Check out microservice code
+        uses: actions/checkout@v4
+
+      - name: Map secret to file
+        if: inputs.SECRET_FILE_PATH && inputs.SECRET_FILE_PATH != ''
+        env:
+          SECRET_FILE_CONTENT: ${{ secrets.SECRET_FILE_CONTENT }}
+          IS_BASE64: ${{ inputs.SECRET_CONTENT_IS_BASE64 || 'false' }}
+        run: |
+          absolute_path="${GITHUB_WORKSPACE}/${{ inputs.SECRET_FILE_PATH }}"
+          if [ -z "$SECRET_FILE_CONTENT" ]; then
+            echo "Secret SECRET_FILE_CONTENT is empty or not set."
+            exit 1
+          fi
+          if [ "$IS_BASE64" = "true" ]; then
+            echo "$SECRET_FILE_CONTENT" | base64 --decode > "$absolute_path"
+          else
+            echo "$SECRET_FILE_CONTENT" > "$absolute_path"
+          fi
+        shell: bash
+
+      - name: Build docker image
+        id: build-image
+        env:
+          SERVICE_NAME: ${{ inputs.SERVICE_NAME }}
+          BUILD_COMMAND: ${{ inputs.BUILD_COMMAND }}
+          CUSTOM_DOCKER_PATH: ${{ inputs.CUSTOM_DOCKER_PATH }}
+        run: |
+          DATE=$(date +%Y%m%d)
+          BUILD_NUMBER=${{ github.run_number }}
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+
+          # Extract squad name from FILE_PATH
+          SQUAD_NAME=$(echo "${{ inputs.FILE_PATH }}" | cut -d'/' -f2)
+
+          REPOSITORY="stg/${SQUAD_NAME}/${SERVICE_NAME}"
+
+          if [ -n "${{ inputs.IMAGE_TAG }}" ]; then
+            BUILD_TAG="${{ inputs.IMAGE_TAG }}"
+          else
+            BUILD_TAG="${DATE}-${BUILD_NUMBER}"
+          fi
+          SHA_TAG="${SHORT_SHA}"
+          LATEST_TAG="latest"
+          LOCAL_IMAGE="${SERVICE_NAME}:${BUILD_TAG}"
+
+          echo "Building image for DEMO environment:"
+          echo "  Repository: $REPOSITORY"
+          echo "  Squad: $SQUAD_NAME"
+          echo "  Service: $SERVICE_NAME"
+          echo "  Build tag: $BUILD_TAG"
+
+          if [ -n "$BUILD_COMMAND" ]; then
+            FULL_COMMAND="$BUILD_COMMAND --build-arg GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}"
+            eval "$FULL_COMMAND -t $LOCAL_IMAGE -t ${SERVICE_NAME}:${SHA_TAG} -t ${SERVICE_NAME}:${LATEST_TAG}"
+          elif [ -n "$CUSTOM_DOCKER_PATH" ]; then
+            eval "$CUSTOM_DOCKER_PATH --build-arg GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} -t $LOCAL_IMAGE -t ${SERVICE_NAME}:${SHA_TAG} -t ${SERVICE_NAME}:${LATEST_TAG}"
+          else
+            docker build \
+              --build-arg GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+              -t $LOCAL_IMAGE \
+              -t ${SERVICE_NAME}:${SHA_TAG} \
+              -t ${SERVICE_NAME}:${LATEST_TAG} \
+              .
+          fi
+
+          echo "image-tag=$BUILD_TAG" >> $GITHUB_OUTPUT
+          echo "build-number-tag=$BUILD_TAG" >> $GITHUB_OUTPUT
+          echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
+          echo "local-image=$LOCAL_IMAGE" >> $GITHUB_OUTPUT
+          echo "sha-tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "latest-tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # DEMO NOTE: Replace the AWS account ID below with your demo account ID.
+      # In prod this is 298382268196 (Egypt staging ECR).
+      # -----------------------------------------------------------------------
+      - name: AWS authentication (Demo ECR)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::367896522183:role/githubactions-ecr
+          role-session-name: Build-ECR-Image-Staging-Demo
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR (Demo)
+        id: login-ecr-demo
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+
+      - name: Push to Demo ECR Registry
+        env:
+          SERVICE_NAME: ${{ inputs.SERVICE_NAME }}
+        run: |
+          REPOSITORY="${{ steps.build-image.outputs.repository }}"
+          LOCAL_IMAGE="${{ steps.build-image.outputs.local-image }}"
+          SHA_TAG="${{ steps.build-image.outputs.sha-tag }}"
+          LATEST_TAG="${{ steps.build-image.outputs.latest-tag }}"
+          BUILD_TAG="${{ steps.build-image.outputs.image-tag }}"
+          REGISTRY="${{ steps.login-ecr-demo.outputs.registry }}"
+
+          if aws ecr describe-repositories --repository-names "$REPOSITORY" --region eu-central-1 2>/dev/null; then
+            echo "Repository $REPOSITORY already exists"
+          else
+            echo "Creating ECR repository: $REPOSITORY"
+            aws ecr create-repository \
+              --repository-name "$REPOSITORY" \
+              --image-scanning-configuration scanOnPush=true \
+              --region eu-central-1
+          fi
+
+          docker tag $LOCAL_IMAGE $REGISTRY/$REPOSITORY:$BUILD_TAG
+          docker tag ${SERVICE_NAME}:${SHA_TAG} $REGISTRY/$REPOSITORY:$SHA_TAG
+          docker tag ${SERVICE_NAME}:${LATEST_TAG} $REGISTRY/$REPOSITORY:$LATEST_TAG
+
+          docker push $REGISTRY/$REPOSITORY:$BUILD_TAG
+          docker push $REGISTRY/$REPOSITORY:$SHA_TAG
+          docker push $REGISTRY/$REPOSITORY:$LATEST_TAG
+
+          echo "Pushed to demo ECR: $REGISTRY/$REPOSITORY"
+
+  deploy:
+    needs: build
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Display deployment information
+        run: |
+          echo "Deploying service: ${{ inputs.SERVICE_NAME }} (DEMO)"
+          echo "Image tag: ${{ needs.build.outputs.image-tag }}"
+          echo "Deployment timestamp: $(date)"
+
+      # -----------------------------------------------------------------------
+      # DEMO NOTE: Replace 'YOUR_DEMO_ORG' with your demo GitHub org name.
+      # In prod this checks out 'moneYOUnion/devops-staging-environment'.
+      # -----------------------------------------------------------------------
+      - name: Checkout demo staging environment repository
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR_DEMO_ORG/devops-staging-environment
+          path: "./staging-env"
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Update service values file
+        run: |
+          FILE_PATH="${{ inputs.FILE_PATH }}"
+          NEW_IMAGE_TAG="${{ needs.build.outputs.image-tag }}"
+          VALUES_FILE="staging-env/eks/${FILE_PATH}"
+
+          if grep -q "imageTag:" "${VALUES_FILE}"; then
+            sed -i "s|imageTag:.*|imageTag: ${NEW_IMAGE_TAG}|g" "${VALUES_FILE}"
+          else
+            echo "imageTag: ${NEW_IMAGE_TAG}" >> "${VALUES_FILE}"
+          fi
+
+      - name: Commit and push changes
+        env:
+          SERVICE_NAME: ${{ inputs.SERVICE_NAME }}
+          NEW_IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+        run: |
+          cd staging-env
+          if git diff --quiet; then
+            echo "No changes detected in values file"
+            exit 0
+          fi
+          git add .
+          git commit -m "chore: update ${SERVICE_NAME} imageTag to ${NEW_IMAGE_TAG} [skip ci]"
+          git push origin main
+          echo "ArgoCD will automatically sync the changes"
