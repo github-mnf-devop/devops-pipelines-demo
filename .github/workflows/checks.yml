@@ -56,10 +56,10 @@ jobs:
         with:
           dotnet-version: '8.0.x'
           # -----------------------------------------------------------------------
-          # DEMO NOTE: Replace 'YOUR_DEMO_ORG' with your demo GitHub org name.
+          # DEMO NOTE: Replace 'github-mnf-devop' with your demo GitHub org name.
           # In prod this pulls from nuget.pkg.github.com/moneYOUnion.
           # -----------------------------------------------------------------------
-          source-url: https://nuget.pkg.github.com/YOUR_DEMO_ORG/index.json
+          source-url: https://nuget.pkg.github.com/github-mnf-devop/index.json
         env:
           NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -132,7 +132,7 @@ jobs:
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
-          source-url: https://nuget.pkg.github.com/YOUR_DEMO_ORG/index.json
+          source-url: https://nuget.pkg.github.com/github-mnf-devop/index.json
         env:
           NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

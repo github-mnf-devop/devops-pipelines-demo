@@ -4,28 +4,24 @@ on:
   workflow_call:
     inputs:
       SERVICE_NAME:
-        description: "Service name"
         required: true
         type: string
       FILE_PATH:
-        description: "Service values file path (e.g. squad/service/values.yaml)"
+        description: "squad/service.yaml — e.g. rosca/circle.yaml"
         required: true
         type: string
       DEPLOYMENT_FILES:
-        description: "Optional comma-separated list of values file paths. If set, all listed files are updated."
+        description: "Optional comma-separated list of FILE_PATH values to update multiple files."
         required: false
         type: string
       SECRET_FILE_PATH:
-        description: "Path to write the content of SECRET_FILE_CONTENT secret"
         required: false
         type: string
       SECRET_CONTENT_IS_BASE64:
-        description: "Base64 decode SECRET_FILE_CONTENT before writing the file"
         required: false
         type: string
     secrets:
       PAT_TOKEN:
-        description: "PAT TOKEN"
         required: true
       SECRET_FILE_CONTENT:
         required: false
@@ -43,21 +39,14 @@ jobs:
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          # -----------------------------------------------------------------------
-          # DEMO NOTE: Replace 'YOUR_DEMO_ORG' with your demo GitHub org name.
-          # In prod this checks membership in 'moneYOUnion/teams/managers'.
-          # -----------------------------------------------------------------------
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: token $PAT_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/orgs/YOUR_DEMO_ORG/teams/managers/memberships/${{ github.actor }}")
-
+            "https://api.github.com/orgs/github-mnf-devop/teams/managers/memberships/${{ github.actor }}")
           if [ "$HTTP_STATUS" != "200" ]; then
-            echo "User '${{ github.actor }}' is not authorized to trigger production deployments."
+            echo "User '${{ github.actor }}' is not authorized."
             exit 1
           fi
-
-          echo "User '${{ github.actor }}' is authorized to deploy to production."
 
   promote-image:
     needs: check-authorization
@@ -73,116 +62,102 @@ jobs:
           IS_BASE64: ${{ inputs.SECRET_CONTENT_IS_BASE64 || 'false' }}
         run: |
           absolute_path="${GITHUB_WORKSPACE}/${{ inputs.SECRET_FILE_PATH }}"
-          if [ -z "$SECRET_FILE_CONTENT" ]; then
-            echo "Secret SECRET_FILE_CONTENT is empty or not set."
-            exit 1
-          fi
+          if [ -z "$SECRET_FILE_CONTENT" ]; then echo "SECRET_FILE_CONTENT is empty." && exit 1; fi
           if [ "$IS_BASE64" = "true" ]; then
             echo "$SECRET_FILE_CONTENT" | base64 --decode > "$absolute_path"
           else
             echo "$SECRET_FILE_CONTENT" > "$absolute_path"
           fi
-        shell: bash
 
-      # -----------------------------------------------------------------------
-      # DEMO NOTE: Replace DEMO_STG_AWS_ACCOUNT_ID with your demo staging account ID.
-      # In prod this is 298382268196.
-      # -----------------------------------------------------------------------
-      - name: AWS authentication (Demo Staging ECR)
+      - name: AWS authentication (Staging ECR)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::367896522183:role/githubactions-ecr
           role-session-name: Pull-Staging-Image-For-Prod
           aws-region: eu-central-1
 
-      - name: Login to Demo Staging Amazon ECR
+      - name: Login to Staging Amazon ECR
         id: login-ecr-staging
         uses: aws-actions/amazon-ecr-login@v2.0.1
 
-      - name: Pull latest image from Demo Staging ECR and extract original tag
+      - name: Resolve staging image tag via ECR API
         run: |
           SQUAD_NAME=$(echo "${{ inputs.FILE_PATH }}" | cut -d'/' -f1)
           STAGING_REPO="stg/${SQUAD_NAME}/${{ inputs.SERVICE_NAME }}"
           STAGING_REGISTRY="${{ steps.login-ecr-staging.outputs.registry }}"
-          STAGING_IMAGE="${STAGING_REGISTRY}/${STAGING_REPO}:latest"
 
-          echo "Pulling staging image: $STAGING_IMAGE"
-          docker pull $STAGING_IMAGE
+          # Get the digest of the :latest tag in ECR
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$STAGING_REPO" \
+            --image-ids imageTag=latest \
+            --query 'imageDetails[0].imageDigest' \
+            --output text \
+            --region eu-central-1)
 
-          STAGING_TAG=$(docker inspect $STAGING_IMAGE \
-            --format '{{range .RepoTags}}{{.}} {{end}}' \
-            | tr ' ' '\n' \
+          # Find the date-based tag (YYYYMMDD-N) that shares that digest
+          STAGING_TAG=$(aws ecr describe-images \
+            --repository-name "$STAGING_REPO" \
+            --image-ids imageDigest="$DIGEST" \
+            --query 'imageDetails[0].imageTags' \
+            --output text \
+            --region eu-central-1 \
+            | tr '\t' '\n' \
             | grep -oP '\d{8}-\d+' \
             | head -1)
 
           if [ -z "$STAGING_TAG" ]; then
+            echo "Could not resolve staging tag from ECR, falling back to date-run_number"
             STAGING_TAG="$(date +%Y%m%d)-${{ github.run_number }}"
           fi
 
-          echo "Original staging tag: $STAGING_TAG"
-          echo "STAGING_IMAGE=$STAGING_IMAGE" >> $GITHUB_ENV
+          echo "Resolved staging tag: $STAGING_TAG"
+          STAGING_IMAGE="${STAGING_REGISTRY}/${STAGING_REPO}:${STAGING_TAG}"
+
+          docker pull "${STAGING_REGISTRY}/${STAGING_REPO}:latest"
+
+          echo "STAGING_IMAGE=${STAGING_REGISTRY}/${STAGING_REPO}:latest" >> $GITHUB_ENV
           echo "SQUAD_NAME=$SQUAD_NAME" >> $GITHUB_ENV
           echo "STAGING_TAG=$STAGING_TAG" >> $GITHUB_ENV
 
-      # -----------------------------------------------------------------------
-      # DEMO NOTE: Replace DEMO_PROD_AWS_ACCOUNT_ID with your demo prod account ID.
-      # In prod this is 827893513553.
-      # -----------------------------------------------------------------------
-      - name: AWS authentication (Demo Prod ECR)
+      - name: AWS authentication (Prod ECR)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::084375550983:role/github-actions-ecr
           role-session-name: Push-ECR-Image-Prod-Demo
           aws-region: eu-central-1
 
-      - name: Login to Demo Prod Amazon ECR
+      - name: Login to Prod Amazon ECR
         id: login-ecr-prod
         uses: aws-actions/amazon-ecr-login@v2.0.1
 
-      - name: Ensure Demo Prod ECR repository exists and push image
+      - name: Tag and push to Prod ECR
         id: promote
         run: |
           PROD_REPO="prod/${SQUAD_NAME}/${{ inputs.SERVICE_NAME }}"
           PROD_REGISTRY="${{ steps.login-ecr-prod.outputs.registry }}"
-          PROD_TAG="$STAGING_TAG"
 
-          if aws ecr describe-repositories --repository-names "$PROD_REPO" --region eu-central-1 2>/dev/null; then
-            echo "Repository $PROD_REPO already exists"
-          else
-            aws ecr create-repository \
-              --repository-name "$PROD_REPO" \
-              --image-scanning-configuration scanOnPush=true \
-              --region eu-central-1
+          if ! aws ecr describe-repositories --repository-names "$PROD_REPO" --region eu-central-1 2>/dev/null; then
+            aws ecr create-repository --repository-name "$PROD_REPO" \
+              --image-scanning-configuration scanOnPush=true --region eu-central-1
           fi
 
-          docker tag $STAGING_IMAGE $PROD_REGISTRY/$PROD_REPO:$PROD_TAG
+          docker tag $STAGING_IMAGE $PROD_REGISTRY/$PROD_REPO:$STAGING_TAG
           docker tag $STAGING_IMAGE $PROD_REGISTRY/$PROD_REPO:latest
 
-          docker push $PROD_REGISTRY/$PROD_REPO:$PROD_TAG
+          docker push $PROD_REGISTRY/$PROD_REPO:$STAGING_TAG
           docker push $PROD_REGISTRY/$PROD_REPO:latest
 
-          echo "image-tag=$PROD_TAG" >> $GITHUB_OUTPUT
-          echo "Promoted staging:latest -> prod: $PROD_REGISTRY/$PROD_REPO:$PROD_TAG"
+          echo "image-tag=$STAGING_TAG" >> $GITHUB_OUTPUT
 
   deploy:
     needs: promote-image
     environment: prod
     runs-on: ubuntu-latest
     steps:
-      - name: Display deployment information
-        run: |
-          echo "Deploying service: ${{ inputs.SERVICE_NAME }} (DEMO PROD)"
-          echo "Prod image tag: ${{ needs.promote-image.outputs.image-tag }}"
-          echo "Deployment timestamp: $(date)"
-
-      # -----------------------------------------------------------------------
-      # DEMO NOTE: Replace 'YOUR_DEMO_ORG' with your demo GitHub org name.
-      # In prod this checks out 'moneYOUnion/devops-iaac-prod-environment'.
-      # -----------------------------------------------------------------------
-      - name: Checkout demo prod deploy repository
+      - name: Checkout prod environment repository
         uses: actions/checkout@v4
         with:
-          repository: YOUR_DEMO_ORG/devops-iaac-prod-environment
+          repository: github-mnf-devop/devops-iaac-prod-environment-demo
           path: "./prod-env"
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
@@ -192,48 +167,38 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      - name: Update service values file
+      - name: Update imageTag in values file(s)
         run: |
           NEW_IMAGE_TAG="${{ needs.promote-image.outputs.image-tag }}"
-          DEPLOYMENT_FILES_INPUT="${{ inputs.DEPLOYMENT_FILES }}"
-          FILE_PATH_INPUT="${{ inputs.FILE_PATH }}"
 
-          if [ -n "$DEPLOYMENT_FILES_INPUT" ]; then
-            TARGET_FILES=$(printf "%s\n" "$DEPLOYMENT_FILES_INPUT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d')
+          if [ -n "${{ inputs.DEPLOYMENT_FILES }}" ]; then
+            TARGET_FILES=$(echo "${{ inputs.DEPLOYMENT_FILES }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           else
-            TARGET_FILES="$FILE_PATH_INPUT"
+            TARGET_FILES="${{ inputs.FILE_PATH }}"
           fi
 
-          UPDATED_COUNT=0
           while IFS= read -r REL_PATH; do
             [ -z "$REL_PATH" ] && continue
-            VALUES_FILE="prod-env/k8s/${REL_PATH}"
+            # FILE_PATH: rosca/circle.yaml  →  full path under k8s/workload/
+            VALUES_FILE="prod-env/k8s/workload/${REL_PATH}"
 
-            if [ ! -f "${VALUES_FILE}" ]; then
-              echo "Values file not found: ${VALUES_FILE}"
-              exit 1
+            if [ ! -f "$VALUES_FILE" ]; then
+              echo "Values file not found: $VALUES_FILE" && exit 1
             fi
 
-            if grep -q "imageTag:" "${VALUES_FILE}"; then
-              sed -i "s|imageTag:.*|imageTag: ${NEW_IMAGE_TAG}|g" "${VALUES_FILE}"
+            if grep -q "imageTag:" "$VALUES_FILE"; then
+              sed -i "s|imageTag:.*|imageTag: ${NEW_IMAGE_TAG}|g" "$VALUES_FILE"
             else
-              echo "imageTag: ${NEW_IMAGE_TAG}" >> "${VALUES_FILE}"
+              echo "imageTag: ${NEW_IMAGE_TAG}" >> "$VALUES_FILE"
             fi
-
-            UPDATED_COUNT=$((UPDATED_COUNT + 1))
+            echo "Updated $VALUES_FILE → imageTag: $NEW_IMAGE_TAG"
           done <<< "$TARGET_FILES"
 
-          echo "Total updated files: ${UPDATED_COUNT}"
-
-      - name: Commit and push changes
+      - name: Commit and push
         run: |
           cd prod-env
-          if git diff --quiet; then
-            echo "No changes detected in values file"
-            exit 0
-          fi
+          if git diff --quiet; then echo "No changes" && exit 0; fi
           NEW_IMAGE_TAG="${{ needs.promote-image.outputs.image-tag }}"
           git add .
           git commit -m "chore: update ${{ inputs.SERVICE_NAME }} imageTag to ${NEW_IMAGE_TAG} [skip ci]"
           git push origin main
-          echo "ArgoCD will automatically sync the changes"
