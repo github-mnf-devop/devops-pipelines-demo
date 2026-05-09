@@ -22,7 +22,7 @@ on:
         type: string
     secrets:
       PAT_TOKEN:
-        required: true
+        required: false
       SECRET_FILE_CONTENT:
         required: false
 
