@@ -123,7 +123,7 @@ jobs:
       - name: AWS authentication (Prod ECR)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::084375550983:role/github-actions-ecr
+          role-to-assume: arn:aws:iam::084375550983:role/githubactions-ecr
           role-session-name: Push-ECR-Image-Prod-Demo
           aws-region: eu-central-1
 
