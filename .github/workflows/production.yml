@@ -34,6 +34,7 @@ permissions:
 jobs:
   check-authorization:
     runs-on: ubuntu-latest
+    environment: prod
     steps:
       - name: Verify triggering user is in managers team
         env:
