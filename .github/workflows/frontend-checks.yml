@@ -1,0 +1,301 @@
+name: Shai-Hulud 2 Scanner
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'Pull request number (for commenting)'
+        required: false
+        type: number
+      strip_private_deps:
+        description: 'Remove private git dependencies before npm install'
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: 'Node.js version to use for this repo'
+        required: true
+        type: string
+      npm_version:
+        description: 'npm version (optional)'
+        required: false
+        type: string
+        default: ''
+      scan_target:
+        description: 'Directory to scan for Shai-Hulud 2 indicators'
+        required: false
+        type: string
+        default: ''
+      fail_on:
+        description: 'Severity level to fail on (critical, high, medium, low)'
+        required: false
+        type: string
+        default: 'critical'
+
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Modify package.json (remove private deps)
+        if: inputs.strip_private_deps
+        run: |
+          jq 'del(.devDependencies["mf-ni-wrapper"]) |
+              del(.devDependencies["com.adjust.sdk"])' \
+            package.json > temp.package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Get npm cache dir
+        id: npm-cache-dir
+        run: echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
+
+      - name: Cache npm packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.npm-cache-dir.outputs.dir }}
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json', '**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Verify Node version
+        run: |
+          echo "Using Node $(node -v)"
+          echo "Using npm $(npm -v)"
+
+      - name: Setup npm (if required)
+        if: inputs.npm_version != ''
+        run: |
+          npm install -g npm@${{ inputs.npm_version }}
+          npm -v
+
+      - name: Install dependencies
+        env:
+          NPM_CONFIG_FETCH_TIMEOUT: 300000
+          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 10000
+          NPM_CONFIG_FETCH_RETRIES: 5
+        run: |
+          if [ "${{ inputs.strip_private_deps }}" = "true" ]; then
+            mv package.json original.package.json
+            mv temp.package.json package.json
+          fi
+
+          # --ignore-scripts blocks preinstall/postinstall hooks (primary Shai-Hulud attack vector)
+          if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+            npm ci --ignore-scripts || npm install --ignore-scripts --prefer-offline || npm install --ignore-scripts
+          else
+            npm install --ignore-scripts --prefer-offline || npm install --ignore-scripts
+          fi
+
+          if [ "${{ inputs.strip_private_deps }}" = "true" ]; then
+            mv original.package.json package.json
+          fi
+
+      - name: Set scanner cache key
+        id: week
+        run: echo "val=$(date +'%Y-W%V')" >> $GITHUB_OUTPUT
+
+      - name: Cache Shai-Hulud scanner
+        id: scanner-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/shai-hulud-scanner
+          key: shai-hulud-scanner-${{ runner.os }}-${{ steps.week.outputs.val }}
+
+      - name: Run Shai-Hulud Supply Chain Scanner
+        id: scan
+        run: |
+          set -uo pipefail
+          WORK_DIR="${{ github.workspace }}"
+          SCAN_TARGET="${{ inputs.scan_target || github.workspace }}"
+          SCAN_WORKDIR="$WORK_DIR/npm-scanner"
+          SCANNER_CACHE="$HOME/.cache/shai-hulud-scanner"
+
+          echo "📦 Scanning node_modules for Shai-Hulud 2 indicators"
+          echo "TARGET: $SCAN_TARGET"
+          echo "FAIL_ON: ${{ inputs.fail_on }}"
+
+          mkdir -p "$SCAN_WORKDIR"
+
+          if [ -f "$SCANNER_CACHE/scan.js" ]; then
+            echo "📦 Using cached scanner"
+            cp -r "$SCANNER_CACHE/." "$SCAN_WORKDIR/"
+          else
+            echo "📥 Cloning scanner repository"
+            git clone --depth 1 https://github.com/moneYOUnion/shai-hulud-2-scanner.git "$SCAN_WORKDIR"
+            mkdir -p "$SCANNER_CACHE"
+            rsync -a --exclude='.git' "$SCAN_WORKDIR/" "$SCANNER_CACHE/"
+          fi
+
+          cd "$SCAN_WORKDIR"
+
+          if [ ! -f "scan.js" ]; then
+            echo "❌ Scanner file 'scan.js' not found after clone"
+            exit 1
+          fi
+
+          echo "🔍 Running scan with --fail-on=${{ inputs.fail_on }}..."
+          SCAN_OUTPUT_FILE="$WORK_DIR/scan-results.txt"
+          if node scan.js "$SCAN_TARGET" --deep --fail-on=${{ inputs.fail_on }} > "$SCAN_OUTPUT_FILE" 2>&1; then
+            SCAN_EXIT=0
+          else
+            SCAN_EXIT=$?
+          fi
+
+          echo ""
+          echo "=== Scan Results ==="
+          cat "$SCAN_OUTPUT_FILE"
+          echo "===================="
+
+          if [ -f "shai-hulud-report.csv" ]; then
+            cp "shai-hulud-report.csv" "$WORK_DIR/" || echo "⚠️  Could not copy CSV report (non-fatal)"
+            echo "📄 CSV report available: shai-hulud-report.csv"
+          fi
+
+          echo "SCAN_EXIT_CODE=$SCAN_EXIT" >> $GITHUB_OUTPUT
+          echo "SCAN_RESULTS_FILE=$SCAN_OUTPUT_FILE" >> $GITHUB_OUTPUT
+
+          cd "$WORK_DIR"
+          rm -rf "$SCAN_WORKDIR"
+
+          if [ $SCAN_EXIT -ne 0 ]; then
+            echo "❌ Scanner found issues (exit code: $SCAN_EXIT)"
+          else
+            echo "✅ Scanner passed - no ${{ inputs.fail_on }} issues found"
+          fi
+          exit $SCAN_EXIT
+
+      - name: Vulnerability Scan
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scanners: 'vuln'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          output: 'trivy-report.txt'
+
+      - name: Install Gitleaks
+        if: always()
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+          | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Secret Scan
+        if: always()
+        run: |
+          BASE_SHA=$(jq -r .pull_request.base.sha "$GITHUB_EVENT_PATH")
+          HEAD_SHA=$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")
+
+          if [ "$BASE_SHA" != "null" ] && [ "$HEAD_SHA" != "null" ]; then
+            echo "Scanning PR diff from $BASE_SHA to $HEAD_SHA"
+            gitleaks detect \
+              --source . \
+              --report-path gitleaks-report.json \
+              --log-opts "$BASE_SHA..$HEAD_SHA" \
+              --exit-code 0
+          else
+            echo "No PR context, scanning full repo"
+            gitleaks detect \
+              --source . \
+              --report-path gitleaks-report.json \
+              --exit-code 0
+          fi
+
+          echo "=== Gitleaks Report ==="
+          cat gitleaks-report.json || echo "No issues found"
+
+      - name: Post PR Comment
+        if: always() && inputs.pr_number > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const scanExit    = '${{ steps.scan.outputs.SCAN_EXIT_CODE }}';
+            const runId       = '${{ github.run_id }}';
+            const repo        = '${{ github.repository }}';
+            const prNumber    = ${{ inputs.pr_number }};
+
+            const icon = (ok) => ok ? '✅' : '❌';
+
+            // Shai-Hulud
+            const shaiOk = scanExit === '0';
+
+            // Gitleaks — read report file
+            const fs = require('fs');
+            let leaksOk = true;
+            try {
+              const report = fs.readFileSync('gitleaks-report.json', 'utf8').trim();
+              leaksOk = report === '[]' || report === '';
+            } catch (_) {}
+
+            // Trivy — parse counts
+            let trivyOk = true;
+            let trivyDetail = '';
+            let trivyFindings = '';
+            try {
+              const trivy = fs.readFileSync('trivy-report.txt', 'utf8');
+              const critCount = (trivy.match(/CRITICAL/g) || []).length;
+              const highCount = (trivy.match(/HIGH/g) || []).length;
+              trivyOk = critCount === 0 && highCount === 0;
+              if (!trivyOk) {
+                trivyDetail = ` — ${critCount} CRITICAL, ${highCount} HIGH`;
+                const lines = trivy.split('\n').filter(l => l.includes('CRITICAL') || l.includes('HIGH') || l.includes('│'));
+                trivyFindings = `\n\n<details>\n<summary>📋 Trivy Findings (click to expand)</summary>\n\n\`\`\`\n${lines.slice(0, 60).join('\n')}\n\`\`\`\n</details>`;
+              }
+            } catch (_) {}
+
+            const body = [
+              '## 🔒 Security Scan Results',
+              '',
+              '| Scanner | Status |',
+              '|---|---|',
+              `| 🛡️ Shai-Hulud Supply Chain | ${icon(shaiOk)} ${shaiOk ? 'Clean' : 'Issues found — check artifacts'} |`,
+              `| 🔑 Secret Scan (Gitleaks) | ${icon(leaksOk)} ${leaksOk ? 'No leaks found' : 'Secrets detected — check artifacts'} |`,
+              `| 🔍 Trivy Vuln Scan | ${icon(trivyOk)} ${trivyOk ? 'No CRITICAL/HIGH CVEs' : 'Vulnerabilities found' + trivyDetail} |`,
+              trivyFindings,
+              '',
+              `> Full reports: [run artifacts](https://github.com/${repo}/actions/runs/${runId})`,
+            ].join('\n');
+
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const marker = '## 🔒 Security Scan Results';
+            const existing = pr.data.body || '';
+            const updated = existing.includes(marker)
+              ? existing.replace(/## 🔒 Security Scan Results[\s\S]*/, body)
+              : existing + '\n\n' + body;
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              body: updated,
+            });
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: |
+            scan-results.txt
+            shai-hulud-report.csv
+            trivy-report.txt
+            gitleaks-report.json
+          retention-days: 15
+          if-no-files-found: ignore
